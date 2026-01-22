@@ -76,10 +76,16 @@ impl VueExtension {
             return Ok(worktree_candidate.to_string_lossy().to_string());
         }
 
-        // Fallback: check the hardcoded one
-        if fs::metadata(SERVER_PATH).is_ok_and(|stat| stat.is_file()) {
+        // Fallback: try the hardcoded one
+        let extension_cwd = env::current_dir().map_err(|e| e.to_string())?;
+        let internal_candidate = extension_cwd.join(SERVER_PATH);
+
+        if fs::metadata(&internal_candidate)
+            .map(|s| s.is_file())
+            .unwrap_or(false)
+        {
             self.did_find_server = true;
-            return Ok(SERVER_PATH.to_string());
+            return Ok(internal_candidate.to_string_lossy().to_string());
         }
 
         // If neither exists, download the default package
@@ -109,7 +115,7 @@ impl VueExtension {
 
         self.install_typescript_if_needed(worktree)?;
         self.did_find_server = true;
-        Ok(SERVER_PATH.to_string())
+        Ok(internal_candidate.to_string_lossy().to_string())
     }
 
     /// Returns whether a local copy of TypeScript exists in the worktree.
@@ -207,23 +213,9 @@ impl zed::Extension for VueExtension {
         worktree: &zed::Worktree,
     ) -> Result<zed::Command> {
         let server_path = self.server_script_path(language_server_id, worktree)?;
-        let server_path_buf = PathBuf::from(&server_path);
-
-        // If server_script_path returned an absolute path (from worktree), use it.
-        // If it returned a relative path (the default SERVER_PATH), resolve it against the extension's CWD.
-        let full_path = if server_path_buf.is_absolute() {
-            server_path_buf
-        } else {
-            let cwd = env::current_dir().map_err(|e| format!("failed to get cwd: {}", e))?;
-            cwd.join(server_path_buf)
-        };
-
         Ok(zed::Command {
             command: zed::node_binary_path()?,
-            args: vec![
-                full_path.to_string_lossy().to_string(),
-                "--stdio".to_string(),
-            ],
+            args: vec![server_path, "--stdio".to_string()],
             env: Default::default(),
         })
     }
