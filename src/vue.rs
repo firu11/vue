@@ -47,35 +47,51 @@ impl VueExtension {
         language_server_id: &zed::LanguageServerId,
         worktree: &zed::Worktree,
     ) -> Result<String> {
-        let mut server_exists = self.server_exists();
-        if self.did_find_server && server_exists {
-            self.install_typescript_if_needed(worktree)?;
-            self.install_ts_plugin_if_needed()?;
-            return Ok(self.settings.server_path.to_string());
-        }
-        let lsp_settings = LspSettings::for_worktree("vue", worktree)
+        // Load settings under key "lsp.vue-language-server"
+        let lsp_settings = LspSettings::for_worktree("vue-language-server", worktree)
             .ok()
             .and_then(|settings| settings.settings)
             .unwrap_or_else(|| json!({}));
-        self.settings = serde_json::from_value(lsp_settings).unwrap_or(Settings {
-            server_path: SERVER_PATH.to_string(),
-            package_json_path: ".".to_string(),
-        });
-        println!(
-            "settings ! server = {} ; pkg  = {}",
-            self.settings.server_path, self.settings.package_json_path
-        );
-        server_exists = self.server_exists();
 
+        // Deserialize settings
+        if let Ok(new_settings) = serde_json::from_value::<Settings>(lsp_settings) {
+            if !new_settings.server_path.is_empty() {
+                self.settings.server_path = new_settings.server_path;
+            }
+            if !new_settings.package_json_path.is_empty() {
+                self.settings.package_json_path = new_settings.package_json_path;
+            }
+        }
+
+        // Resolve the configured path against the worktree root
+        let worktree_candidate =
+            PathBuf::from(worktree.root_path()).join(&self.settings.server_path);
+
+        // If the file exists in the worktree, return the absolute path immediately
+        if fs::metadata(&worktree_candidate).is_ok_and(|stat| stat.is_file()) {
+            self.install_typescript_if_needed(worktree)?;
+            self.install_ts_plugin_if_needed()?;
+            self.did_find_server = true;
+            // Return the absolute path so command logic doesn't have to guess
+            return Ok(worktree_candidate.to_string_lossy().to_string());
+        }
+
+        // Fallback: check the hardcoded one
+        if fs::metadata(SERVER_PATH).is_ok_and(|stat| stat.is_file()) {
+            self.did_find_server = true;
+            return Ok(SERVER_PATH.to_string());
+        }
+
+        // If neither exists, download the default package
         zed::set_language_server_installation_status(
             language_server_id,
             &zed::LanguageServerInstallationStatus::CheckingForUpdate,
         );
-        let version = zed::npm_package_latest_version(PACKAGE_NAME)?;
 
-        if !server_exists
-            || zed::npm_package_installed_version(PACKAGE_NAME)?.as_ref() != Some(&version)
-        {
+        let version = zed::npm_package_latest_version(PACKAGE_NAME)?;
+        let installed_version = zed::npm_package_installed_version(PACKAGE_NAME)?;
+
+        if !fs::metadata(SERVER_PATH).is_ok() || installed_version.as_ref() != Some(&version) {
             zed::set_language_server_installation_status(
                 language_server_id,
                 &zed::LanguageServerInstallationStatus::Downloading,
@@ -93,7 +109,7 @@ impl VueExtension {
 
         self.install_typescript_if_needed(worktree)?;
         self.did_find_server = true;
-        Ok(self.settings.server_path.to_string())
+        Ok(SERVER_PATH.to_string())
     }
 
     /// Returns whether a local copy of TypeScript exists in the worktree.
@@ -191,13 +207,21 @@ impl zed::Extension for VueExtension {
         worktree: &zed::Worktree,
     ) -> Result<zed::Command> {
         let server_path = self.server_script_path(language_server_id, worktree)?;
+        let server_path_buf = PathBuf::from(&server_path);
+
+        // If server_script_path returned an absolute path (from worktree), use it.
+        // If it returned a relative path (the default SERVER_PATH), resolve it against the extension's CWD.
+        let full_path = if server_path_buf.is_absolute() {
+            server_path_buf
+        } else {
+            let cwd = env::current_dir().map_err(|e| format!("failed to get cwd: {}", e))?;
+            cwd.join(server_path_buf)
+        };
+
         Ok(zed::Command {
             command: zed::node_binary_path()?,
             args: vec![
-                PathBuf::from(worktree.root_path())
-                    .join(&server_path)
-                    .to_string_lossy()
-                    .to_string(),
+                full_path.to_string_lossy().to_string(),
                 "--stdio".to_string(),
             ],
             env: Default::default(),
